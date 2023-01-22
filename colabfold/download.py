@@ -9,7 +9,9 @@ logger = logging.getLogger(__name__)
 
 # The data dir location logic switches between a version with and one without "params" because alphafold
 # always internally joins "params". (We should probably patch alphafold)
-default_data_dir = Path(appdirs.user_cache_dir(__package__ or "colabfold"))
+# default_data_dir = Path(appdirs.user_cache_dir(__package__ or "colabfold"))
+# default_data_dir = Path("/scratch/projects/bioinfo/data/model")
+default_data_dir = Path("~/scratch/fred862/code/bioinfo/data/model")
 
 
 def download_alphafold_params(model_type: str, data_dir: Path = default_data_dir):
