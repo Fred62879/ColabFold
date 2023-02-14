@@ -23,6 +23,13 @@ import importlib_metadata
 import numpy as np
 import pandas
 
+# hack to use local alphafold directory
+import sys
+sys.path.insert(0,'/scratch/projects/bioinfo/code/alphafold/')
+#sys.path.insert(0,'/scratch/projects/bioinfo/code/alphafold/alphafold')
+#print(sys.path)
+#print(alphafold)
+
 try:
     import alphafold
 except ModuleNotFoundError:
@@ -48,6 +55,9 @@ from alphafold.data import (
     templates,
 )
 from alphafold.data.tools import hhsearch
+
+#import colabfold
+#print(colabfold)
 from colabfold.citations import write_bibtex
 from colabfold.download import default_data_dir, download_alphafold_params
 from colabfold.utils import (
@@ -1218,6 +1228,7 @@ def run(
     result_dir.mkdir(exist_ok=True)
     model_type = set_model_type(is_complex, model_type)
 
+    print(f"Model type: {model_type}")
     if model_type == "AlphaFold2-multimer-v1":
         model_extension = "_multimer"
     elif model_type == "AlphaFold2-multimer-v2":
@@ -1316,6 +1327,7 @@ def run(
             f"Query {job_number + 1}/{len(queries)}: {jobname} (length {query_sequence_len})"
         )
 
+        # i) get msas
         try:
             if a3m_lines is not None:
                 if use_templates is False:
@@ -1367,6 +1379,8 @@ def run(
         except Exception as e:
             logger.exception(f"Could not get MSA/templates for {jobname}: {e}")
             continue
+
+        # ii) generate input features
         try:
             (input_features, domain_names) = generate_input_feature(
                 query_seqs_unique,
@@ -1380,6 +1394,8 @@ def run(
         except Exception as e:
             logger.exception(f"Could not generate input features {jobname}: {e}")
             continue
+
+        # iii) predict structure
         try:
             query_sequence_len_array = [
                 len(query_seqs_unique[i])
