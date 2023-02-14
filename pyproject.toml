@@ -49,9 +49,9 @@ alphafold-minus-jax = ["alphafold-colabfold"]
 addopts = "--tb=short"
 
 [tool.poetry.scripts]
-colabfold_batch = 'colabfold.batch:main'
-colabfold_search = 'colabfold.mmseqs.search:main'
-colabfold_split_msas = 'colabfold.mmseqs.split_msas:main'
+colabfold_batch = 'colabfold.batch:main_fred'
+colabfold_search = 'colabfold.mmseqs.search:main_fred'
+colabfold_split_msas = 'colabfold.mmseqs.split_msas:main_fred'
 
 [tool.black]
 # Format only the new package, don't touch the existing stuff
