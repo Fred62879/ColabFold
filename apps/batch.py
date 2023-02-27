@@ -25,9 +25,9 @@ import pandas
 
 # hack to use local alphafold directory
 import sys
-sys.path.insert(0,'/scratch/projects/bioinfo/code/alphafold/')
-#sys.path.insert(0,'/scratch/projects/bioinfo/code/alphafold/alphafold')
+sys.path.insert(0,'/scratch/projects/bioinfo/code/colabfold/')
 #print(sys.path)
+#import alphafold
 #print(alphafold)
 
 try:
@@ -836,6 +836,7 @@ def get_msa_and_templates(
                 use_pairing=False,
                 host_url=host_url,
             )
+            #print(a3m_lines)
     else:
         a3m_lines = None
 
@@ -1306,14 +1307,19 @@ def run(
 
     crop_len = 0
     for job_number, (raw_jobname, query_sequence, a3m_lines) in enumerate(queries):
+        raw_jobname = raw_jobname[:4]
         jobname = safe_filename(raw_jobname)
         # In the colab version and with --zip we know we're done when a zip file has been written
-        result_zip = result_dir.joinpath(jobname).with_suffix(".result.zip")
+        cur_result_dir = result_dir.joinpath(raw_jobname)
+        if not os.path.exists(cur_result_dir):
+            os.mkdir(cur_result_dir)
+
+        result_zip = cur_result_dir.joinpath(jobname).with_suffix(".result.zip")
         if keep_existing_results and result_zip.is_file():
             logger.info(f"Skipping {jobname} (result.zip)")
             continue
         # In the local version we use a marker file
-        is_done_marker = result_dir.joinpath(jobname + ".done.txt")
+        is_done_marker = cur_result_dir.joinpath(jobname + ".done.txt")
         if keep_existing_results and is_done_marker.is_file():
             logger.info(f"Skipping {jobname} (already done)")
             continue
@@ -1348,7 +1354,7 @@ def run(
                     template_features = get_msa_and_templates(
                         jobname,
                         query_sequence,
-                        result_dir,
+                        cur_result_dir,
                         msa_mode,
                         use_templates,
                         custom_template_path,
@@ -1365,7 +1371,7 @@ def run(
                 ) = get_msa_and_templates(
                     jobname,
                     query_sequence,
-                    result_dir,
+                    cur_result_dir,
                     msa_mode,
                     use_templates,
                     custom_template_path,
@@ -1375,7 +1381,7 @@ def run(
             msa = msa_to_str(
                 unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality
             )
-            result_dir.joinpath(jobname + ".a3m").write_text(msa)
+            cur_result_dir.joinpath(jobname + ".a3m").write_text(msa)
         except Exception as e:
             logger.exception(f"Could not get MSA/templates for {jobname}: {e}")
             continue
@@ -1409,7 +1415,7 @@ def run(
 
             outs, model_rank = predict_structure(
                 jobname,
-                result_dir,
+                cur_result_dir,
                 input_features,
                 is_complex,
                 use_templates,
@@ -1443,20 +1449,20 @@ def run(
 
                 if save_single_representations:
                     single_representation = np.asarray(representations["single"])
-                    single_filename = result_dir.joinpath(
+                    single_filename = cur_result_dir.joinpath(
                         f"{jobname}_single_repr_{model_id}_{model_name}"
                     )
                     np.save(single_filename, single_representation)
 
                 if save_pair_representations:
                     pair_representation = np.asarray(representations["pair"])
-                    pair_filename = result_dir.joinpath(
+                    pair_filename = cur_result_dir.joinpath(
                         f"{jobname}_pair_repr_{model_id}_{model_name}"
                     )
                     np.save(pair_filename, pair_representation)
 
         # Write alphafold-db format (PAE)
-        alphafold_pae_file = result_dir.joinpath(
+        alphafold_pae_file = cur_result_dir.joinpath(
             jobname + "_predicted_aligned_error_v1.json"
         )
         alphafold_pae_file.write_text(get_pae_json(outs[0]["pae"], outs[0]["max_pae"]))
@@ -1472,33 +1478,33 @@ def run(
             query_sequence_len,
             dpi=dpi,
         )
-        coverage_png = result_dir.joinpath(jobname + "_coverage.png")
+        coverage_png = cur_result_dir.joinpath(jobname + "_coverage.png")
         msa_plot.savefig(str(coverage_png))
         msa_plot.close()
         paes_plot = plot_paes(
             [outs[k]["pae"] for k in model_rank], Ls=query_sequence_len_array, dpi=dpi
         )
-        pae_png = result_dir.joinpath(jobname + "_PAE.png")
+        pae_png = cur_result_dir.joinpath(jobname + "_PAE.png")
         paes_plot.savefig(str(pae_png))
         paes_plot.close()
         plddt_plot = plot_plddts(
             [outs[k]["plddt"] for k in model_rank], Ls=query_sequence_len_array, dpi=dpi
         )
-        plddt_png = result_dir.joinpath(jobname + "_plddt.png")
+        plddt_png = cur_result_dir.joinpath(jobname + "_plddt.png")
         plddt_plot.savefig(str(plddt_png))
         plddt_plot.close()
         result_files = [
             bibtex_file,
             config_out_file,
             alphafold_pae_file,
-            result_dir.joinpath(jobname + ".a3m"),
+            cur_result_dir.joinpath(jobname + ".a3m"),
             pae_png,
             coverage_png,
             plddt_png,
             *representation_files,
         ]
         if use_templates:
-            templates_file = result_dir.joinpath(
+            templates_file = cur_result_dir.joinpath(
                 jobname + "_template_domain_names.json"
             )
             templates_file.write_text(json.dumps(domain_names))
@@ -1506,18 +1512,18 @@ def run(
 
         for i, key in enumerate(model_rank):
             result_files.append(
-                result_dir.joinpath(
+                cur_result_dir.joinpath(
                     f"{jobname}_unrelaxed_rank_{i + 1}_{outs[key]['model_name']}.pdb"
                 )
             )
             result_files.append(
-                result_dir.joinpath(
+                cur_result_dir.joinpath(
                     f"{jobname}_unrelaxed_rank_{i + 1}_{outs[key]['model_name']}_scores.json"
                 )
             )
             if use_amber:
                 result_files.append(
-                    result_dir.joinpath(
+                    cur_result_dir.joinpath(
                         f"{jobname}_relaxed_rank_{i + 1}_{outs[key]['model_name']}.pdb"
                     )
                 )
