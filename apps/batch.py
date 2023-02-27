@@ -341,7 +341,7 @@ def predict_structure(
     seq_len = sum(sequences_lengths)
 
     model_names = []
-    for (model_name, model_runner, params) in model_runner_and_params:
+    for (model_name, model_runner, params) in model_runner_and_params[:1]:
         logger.info(f"Running {model_name}")
         model_names.append(model_name)
         # swap params to avoid recompiling
@@ -507,6 +507,7 @@ def predict_structure(
             relaxed_pdb_path = result_dir.joinpath(f"{prefix}_relaxed_{model_name}.pdb")
             relaxed_pdb_path.write_text(relaxed_pdb_str)
             relaxed_pdb_lines.append(relaxed_pdb_str)
+
         # early stop criteria fulfilled
         if mean_score > stop_at_score or mean_score < stop_at_score_below:
             break
@@ -519,47 +520,60 @@ def predict_structure(
         model_rank = rank_array.argsort()[::-1]
     else:
         model_rank = np.mean(plddts, -1).argsort()[::-1]
+
     out = {}
+    scores = {}
     logger.info(f"reranking models by {rank_by}")
+
     for n, key in enumerate(model_rank):
         unrelaxed_pdb_path = result_dir.joinpath(
-            f"{prefix}_unrelaxed_rank_{n + 1}_{model_names[key]}.pdb"
+            f"unrelaxed_rank_{n + 1}.pdb"
         )
         unrelaxed_pdb_path.write_text(unrelaxed_pdb_lines[key])
 
         unrelaxed_pdb_path_unranked = result_dir.joinpath(
-            f"{prefix}_unrelaxed_{model_names[key]}.pdb"
+            f"unrelaxed_{model_names[key]}.pdb"
         )
         if unrelaxed_pdb_path_unranked.is_file():
             unrelaxed_pdb_path_unranked.unlink()
 
         if do_relax:
             relaxed_pdb_path = result_dir.joinpath(
-                f"{prefix}_relaxed_rank_{n + 1}_{model_names[key]}.pdb"
+                f"relaxed_rank_{n + 1}.pdb"
             )
             relaxed_pdb_path.write_text(relaxed_pdb_lines[key])
 
             relaxed_pdb_path_unranked = result_dir.joinpath(
-                f"{prefix}_relaxed_{model_names[key]}.pdb"
+                f"relaxed_{model_names[key]}.pdb"
             )
             if relaxed_pdb_path_unranked.is_file():
                 relaxed_pdb_path_unranked.unlink()
 
-        # Write an easy-to-use format (PAE and plDDT)
-        scores_file = result_dir.joinpath(
-            f"{prefix}_unrelaxed_rank_{n + 1}_{model_names[key]}_scores.json"
-        )
-        with scores_file.open("w") as fp:
-            # We use astype(np.float64) to prevent very long stringified floats from float imprecision
-            scores = {
-                "max_pae": max_paes[key],
-                "pae": np.around(np.asarray(paes[key]).astype(np.float64), 2).tolist(),
-                "plddt": np.around(np.asarray(plddts[key]), 2).tolist(),
-                "ptm": np.around(ptmscore[key], 2).item(),
-            }
-            if model_type.startswith("AlphaFold2-multimer"):
-                scores["iptm"] = np.around(iptmscore[key], 2).item()
-            json.dump(scores, fp)
+        # We use astype(np.float64) to prevent very long
+        #   stringified floats from float imprecision
+        cur_score = {
+            "order": n,
+            "model": model_names[key],
+            "max_paes": max_paes[key],
+            "plddt": np.mean(np.around(np.asarray(plddts[key]), 2)),
+            "ptmscore": np.around(ptmscore[key], 2).item()
+        }
+
+        score_dir = f"{result_dir}/scores/"
+        if not os.path.exists(score_dir):
+            os.mkdir(score_dir)
+
+        np.save(
+            f"{score_dir}/plddts_{n + 1}_{model_names[key]}",
+            np.around(np.asarray(plddts[key]), 2).tolist())
+
+        np.save(
+            f"{score_dir}/paes_{n + 1}_{model_names[key]}",
+            np.around(np.asarray(paes[key]).astype(np.float64), 2))
+
+        if model_type.startswith("AlphaFold2-multimer"):
+            cur_score["iptm"] = np.around(iptmscore[key], 2).item()
+        scores[str(key)] = cur_score
 
         out[key] = {
             "plddt": np.asarray(plddts[key]),
@@ -569,6 +583,14 @@ def predict_structure(
             "model_name": model_names[key],
             "representations": representations[key],
         }
+
+    # Write an easy-to-use format (PAE and plDDT)
+    scores_file = result_dir.joinpath(
+        f"unrelaxed_scores.json"
+    )
+    with scores_file.open("w") as fp:
+        json.dump(scores, fp)
+
     return out, model_rank
 
 
@@ -1218,6 +1240,7 @@ def run(
     stop_at_score_below: float = 0,
     dpi: int = 200,
     max_msa: str = None,
+    strategy: str = "multimer"
 ):
     from alphafold.notebooks.notebook_utils import get_pae_json
     from colabfold.alphafold.models import load_models_and_params
@@ -1310,9 +1333,8 @@ def run(
         raw_jobname = raw_jobname[:4]
         jobname = safe_filename(raw_jobname)
         # In the colab version and with --zip we know we're done when a zip file has been written
-        cur_result_dir = result_dir.joinpath(raw_jobname)
-        if not os.path.exists(cur_result_dir):
-            os.mkdir(cur_result_dir)
+        cur_result_dir = result_dir.joinpath(f"{raw_jobname}.fasta")
+        cur_result_dir.mkdir(parents=True, exist_ok=True)
 
         result_zip = cur_result_dir.joinpath(jobname).with_suffix(".result.zip")
         if keep_existing_results and result_zip.is_file():
@@ -1740,6 +1762,10 @@ def main():
         "--overwrite-existing-results", default=False, action="store_true"
     )
 
+    parser.add_argument(
+        "--strategy", help="defines: `strategy to deal with multimer`", type=str, default="multimer", choices=["multimer","poly_g_20"]
+    )
+
     args = parser.parse_args()
 
     setup_logging(Path(args.results).joinpath("log.txt"))
@@ -1805,6 +1831,7 @@ def main():
         max_msa=args.max_msa,
         use_gpu_relax=args.use_gpu_relax,
         stop_at_score_below=args.stop_at_score_below,
+        strategy=args.strategy
     )
 
 
