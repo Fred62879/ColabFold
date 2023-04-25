@@ -61,16 +61,19 @@ def load_models_and_params(
                 max_msa_clusters, max_extra_msa = [int(x) for x in max_msa.split(":")]
                 model_config.data.eval.max_msa_clusters = max_msa_clusters
                 model_config.data.common.max_extra_msa = max_extra_msa
+
             if model_suffix == "_ptm":
                 model_config.data.common.num_recycle = num_recycle
                 model_config.model.num_recycle = num_recycle
                 model_config.data.eval.num_ensemble = num_ensemble
+
             elif model_suffix.startswith("_multimer"):
                 model_config.model.num_recycle = num_recycle
                 if training:
                     model_config.model.num_ensemble_train = num_ensemble
                 else:
                     model_config.model.num_ensemble_eval = num_ensemble
+
             model_runner_and_params.append(
                 (
                     model_name,
@@ -78,6 +81,7 @@ def load_models_and_params(
                     params,
                 )
             )
+
     else:
         models_need_compilation = [1, 3] if use_templates else [3]
         model_build_order = [3, 4, 5, 1, 2]

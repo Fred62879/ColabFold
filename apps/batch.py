@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from os.path import join, exists
 
 os.environ["TF_FORCE_UNIFIED_MEMORY"] = "1"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "2.0"
@@ -13,6 +14,7 @@ import sys
 import time
 import zipfile
 import shutil
+import pickle
 
 from argparse import ArgumentParser
 from pathlib import Path
@@ -26,9 +28,6 @@ import pandas
 # hack to use local alphafold directory
 import sys
 sys.path.insert(0,'/scratch/projects/bioinfo/code/colabfold/')
-#print(sys.path)
-#import alphafold
-#print(alphafold)
 
 try:
     import alphafold
@@ -55,9 +54,6 @@ from alphafold.data import (
     templates,
 )
 from alphafold.data.tools import hhsearch
-
-#import colabfold
-#print(colabfold)
 from colabfold.citations import write_bibtex
 from colabfold.download import default_data_dir, download_alphafold_params
 from colabfold.utils import (
@@ -341,7 +337,7 @@ def predict_structure(
     seq_len = sum(sequences_lengths)
 
     model_names = []
-    for (model_name, model_runner, params) in model_runner_and_params[:1]:
+    for (model_name, model_runner, params) in model_runner_and_params:
         logger.info(f"Running {model_name}")
         model_names.append(model_name)
         # swap params to avoid recompiling
@@ -708,6 +704,7 @@ def get_queries(
         if isinstance(query_sequence, list):
             is_complex = True
             break
+
         if a3m_lines is not None and a3m_lines[0].startswith("#"):
             a3m_line = a3m_lines[0].splitlines()[0]
             tab_sep_entries = a3m_line[1:].split("\t")
@@ -724,6 +721,7 @@ def get_queries(
                 if not is_single_protein:
                     is_complex = True
                     break
+
     return queries, is_complex
 
 
@@ -844,13 +842,17 @@ def get_msa_and_templates(
         pair_mode = "none"
 
     if pair_mode == "none" or pair_mode == "unpaired" or pair_mode == "unpaired+paired":
+        print(f"**** When retriving MSA, msa mode is {msa_mode}")
+
         if msa_mode == "single_sequence":
+            print("Don't run mmseqs2")
             a3m_lines = []
             num = 101
             for i, seq in enumerate(query_seqs_unique):
                 a3m_lines.append(">" + str(num + i) + "\n" + seq)
         else:
             # find normal a3ms
+            print("Run mmseqs2")
             a3m_lines = run_mmseqs2(
                 query_seqs_unique,
                 str(result_dir.joinpath(jobname)),
@@ -858,7 +860,6 @@ def get_msa_and_templates(
                 use_pairing=False,
                 host_url=host_url,
             )
-            #print(a3m_lines)
     else:
         a3m_lines = None
 
@@ -1208,40 +1209,94 @@ def msa_to_str(
     msa += pair_msa(query_seqs_unique, query_seqs_cardinality, paired_msa, unpaired_msa)
     return msa
 
+def str_to_msa(msa_fname):
+    return None, None, None, None
 
-def run(
-    queries: List[Tuple[str, Union[str, List[str]], Optional[List[str]]]],
-    result_dir: Union[str, Path],
-    num_models: int,
-    num_recycles: int,
-    model_order: List[int],
-    is_complex: bool,
-    num_ensemble: int = 1,
-    model_type: str = "auto",
-    msa_mode: str = "MMseqs2 (UniRef+Environmental)",
-    use_templates: bool = False,
-    custom_template_path: str = None,
-    use_amber: bool = False,
-    keep_existing_results: bool = True,
-    rank_by: str = "auto",
-    pair_mode: str = "unpaired+paired",
-    data_dir: Union[str, Path] = default_data_dir,
-    host_url: str = DEFAULT_API_SERVER,
-    random_seed: int = 0,
-    stop_at_score: float = 100,
-    recompile_padding: float = 1.1,
-    recompile_all_models: bool = False,
-    zip_results: bool = False,
-    prediction_callback: Callable[[Any, Any, Any, Any, Any], Any] = None,
-    save_single_representations: bool = False,
-    save_pair_representations: bool = False,
-    training: bool = False,
-    use_gpu_relax: bool = False,
-    stop_at_score_below: float = 0,
-    dpi: int = 200,
-    max_msa: str = None,
-    strategy: str = "multimer"
-):
+def generate_msa(cur_result_dir, raw_jobname, jobname, use_templates, a3m_lines,
+                 query_sequence, msa_mode, custom_template_path, pair_mode, host_url):
+
+    """ Generate msa on the fly or read from local cache.
+    """
+    load_cache = False
+    a3m_fname = join(cur_result_dir, f"{raw_jobname}.a3m")
+    template_feat_fname = join(cur_result_dir, f"{raw_jobname}_template_feats.txt")
+
+    # if exists(a3m_fname) and exists(template_feat_fname):
+    #     # read from local cache
+    #     load_cache = True
+    #     unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality = \
+    #         str_to_msa(a3m_fname)
+
+    #     with open(template_feat_fname, "rb") as fp:
+    #         template_features = pickle.load(fp)
+
+    if a3m_lines is not None:
+        if use_templates is False:
+            (unpaired_msa, paired_msa, query_seqs_unique,
+             query_seqs_cardinality, template_features) = \
+                 unserialize_msa(a3m_lines, query_sequence)
+        else:
+            (unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality) = \
+                unserialize_msa(a3m_lines, query_sequence)[:4]
+
+            template_features = get_msa_and_templates(
+                jobname, query_sequence, cur_result_dir, msa_mode, use_templates,
+                custom_template_path, pair_mode, host_url)[4]
+    else:
+        unpaired_msa, paired_msa, query_seqs_unique, \
+            query_seqs_cardinality, template_features = get_msa_and_templates(
+                jobname, query_sequence, cur_result_dir, msa_mode,
+                use_templates, custom_template_path, pair_mode, host_url)
+
+    # print(query_sequence)
+    print('*********')
+    # print(query_seqs_unique)
+    print(query_seqs_cardinality)
+    assert 0
+
+    if not load_cache:
+        msa = msa_to_str(unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality)
+        cur_result_dir.joinpath(jobname + ".a3m").write_text(msa)
+
+        with open(template_feat_fname, "wb") as fp:
+            pickle.dump(template_features, fp)
+
+    return unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality, template_features
+
+def run(queries: List[Tuple[str, Union[str, List[str]], Optional[List[str]]]],
+        result_dir: Union[str, Path],
+        num_models: int,
+        num_recycles: int,
+        model_order: List[int],
+        is_complex: bool,
+        num_ensemble: int = 1,
+        model_type: str = "auto",
+        msa_mode: str = "MMseqs2 (UniRef+Environmental)",
+        use_templates: bool = False,
+        custom_template_path: str = None,
+        use_amber: bool = False,
+        keep_existing_results: bool = True,
+        rank_by: str = "auto",
+        pair_mode: str = "unpaired+paired",
+        data_dir: Union[str, Path] = default_data_dir,
+        host_url: str = DEFAULT_API_SERVER,
+        random_seed: int = 0,
+        stop_at_score: float = 100,
+        recompile_padding: float = 1.1,
+        recompile_all_models: bool = False,
+        zip_results: bool = False,
+        prediction_callback: Callable[[Any, Any, Any, Any, Any], Any] = None,
+        save_single_representations: bool = False,
+        save_pair_representations: bool = False,
+        training: bool = False,
+        use_gpu_relax: bool = False,
+        stop_at_score_below: float = 0,
+        dpi: int = 200,
+        max_msa: str = None,
+        strategy: str = "multimer",
+        generate_msa_only: bool = False,
+        max_num_queries: int=-1):
+
     from alphafold.notebooks.notebook_utils import get_pae_json
     from colabfold.alphafold.models import load_models_and_params
     from colabfold.colabfold import plot_paes, plot_plddts
@@ -1295,6 +1350,8 @@ def run(
         "commit": get_commit(),
         "is_training": training,
         "version": importlib_metadata.version("colabfold"),
+        "generate_msa_only": generate_msa_only,
+        "max_num_queries": max_num_queries
     }
     config_out_file = result_dir.joinpath("config.json")
     config_out_file.write_text(json.dumps(config, indent=4))
@@ -1329,6 +1386,9 @@ def run(
         mk_hhsearch_db(custom_template_path)
 
     crop_len = 0
+    if queries != -1:
+        queries = queries[:max_num_queries]
+
     for job_number, (raw_jobname, query_sequence, a3m_lines) in enumerate(queries):
         raw_jobname = raw_jobname[:4]
         jobname = safe_filename(raw_jobname)
@@ -1357,56 +1417,16 @@ def run(
 
         # i) get msas
         try:
-            if a3m_lines is not None:
-                if use_templates is False:
-                    (
-                        unpaired_msa,
-                        paired_msa,
-                        query_seqs_unique,
-                        query_seqs_cardinality,
-                        template_features,
-                    ) = unserialize_msa(a3m_lines, query_sequence)
-                else:
-                    (
-                        unpaired_msa,
-                        paired_msa,
-                        query_seqs_unique,
-                        query_seqs_cardinality,
-                    ) = unserialize_msa(a3m_lines, query_sequence)[:4]
-                    template_features = get_msa_and_templates(
-                        jobname,
-                        query_sequence,
-                        cur_result_dir,
-                        msa_mode,
-                        use_templates,
-                        custom_template_path,
-                        pair_mode,
-                        host_url,
-                    )[4]
-            else:
-                (
-                    unpaired_msa,
-                    paired_msa,
-                    query_seqs_unique,
-                    query_seqs_cardinality,
-                    template_features,
-                ) = get_msa_and_templates(
-                    jobname,
-                    query_sequence,
-                    cur_result_dir,
-                    msa_mode,
-                    use_templates,
-                    custom_template_path,
-                    pair_mode,
-                    host_url,
-                )
-            msa = msa_to_str(
-                unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality
-            )
-            cur_result_dir.joinpath(jobname + ".a3m").write_text(msa)
+            unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality, \
+                template_features = generate_msa(
+                    cur_result_dir, raw_jobname, jobname, use_templates, a3m_lines,
+                    query_sequence, msa_mode, custom_template_path, pair_mode, host_url)
+
         except Exception as e:
             logger.exception(f"Could not get MSA/templates for {jobname}: {e}")
             continue
+
+        if generate_msa_only: continue
 
         # ii) generate input features
         try:
@@ -1763,12 +1783,30 @@ def main():
     )
 
     parser.add_argument(
-        "--strategy", help="defines: `strategy to deal with multimer`", type=str, default="multimer", choices=["multimer","poly_g_20"]
+        "--strategy", help="defines: `strategy to deal with multimer`", type=str, default="multimer", choices=["multimer","poly_g_20","ptm"]
+    )
+
+    parser.add_argument(
+        "--generate-msa-only",
+        default=False,
+        action="store_true",
+        help="Generate msa only, dont run structure prediction."
+    )
+
+    parser.add_argument(
+        "--max-num-queries",
+        type=int,
+        default=-1,
+        help="Maximum number of queries."
     )
 
     args = parser.parse_args()
 
-    setup_logging(Path(args.results).joinpath("log.txt"))
+    data_dir = Path(args.data or default_data_dir)
+    input_path = os.path.join(args.input, args.strategy)
+    output_path = os.path.join(args.results, args.strategy)
+
+    setup_logging(Path(output_path).joinpath("log.txt"))
 
     version = importlib_metadata.version("colabfold")
     commit = get_commit()
@@ -1777,8 +1815,6 @@ def main():
 
     logger.info(f"Running colabfold {version}")
 
-    data_dir = Path(args.data or default_data_dir)
-
     # Prevent people from accidentally running on the cpu, which is really slow
     from jax.lib import xla_bridge
 
@@ -1786,7 +1822,7 @@ def main():
         print(NO_GPU_FOUND, file=sys.stderr)
         sys.exit(1)
 
-    queries, is_complex = get_queries(args.input, args.sort_queries_by)
+    queries, is_complex = get_queries(input_path, args.sort_queries_by)
     model_type = set_model_type(is_complex, args.model_type)
     if model_type.startswith("AlphaFold2-multimer"):
         logger.info(
@@ -1804,7 +1840,7 @@ def main():
 
     run(
         queries=queries,
-        result_dir=args.results,
+        result_dir=output_path,
         use_templates=args.templates,
         custom_template_path=args.custom_template_path,
         use_amber=args.amber,
@@ -1831,7 +1867,9 @@ def main():
         max_msa=args.max_msa,
         use_gpu_relax=args.use_gpu_relax,
         stop_at_score_below=args.stop_at_score_below,
-        strategy=args.strategy
+        strategy=args.strategy,
+        generate_msa_only=args.generate_msa_only,
+        max_num_queries=args.max_num_queries
     )
 
 
