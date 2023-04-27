@@ -306,6 +306,739 @@ def batch_input(
     )  # template_mask (4, 4) second value
     return input_fix
 
+def parse_fasta(fasta_string: str) -> Tuple[List[str], List[str]]:
+    """Parses FASTA string and returns list of strings with amino-acid sequences.
+
+    Arguments:
+      fasta_string: The string contents of a FASTA file.
+
+    Returns:
+      A tuple of two lists:
+      * A list of sequences.
+      * A list of sequence descriptions taken from the comment lines. In the
+        same order as the sequences.
+    """
+    sequences = []
+    descriptions = []
+    index = -1
+    for line in fasta_string.splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            continue
+        if line.startswith(">"):
+            index += 1
+            descriptions.append(line[1:])  # Remove the '>' at the beginning.
+            sequences.append("")
+            continue
+        elif not line:
+            continue  # Skip blank lines.
+        sequences[index] += line
+
+    return sequences, descriptions
+
+def get_queries(
+    input_path: Union[str, Path], sort_queries_by: str = "length"
+) -> Tuple[List[Tuple[str, str, Optional[List[str]]]], bool]:
+    """Reads a directory of fasta files, a single fasta file or a csv file and returns a tuple
+    of job name, sequence and the optional a3m lines"""
+
+    input_path = Path(input_path)
+    if not input_path.exists():
+        raise OSError(f"{input_path} could not be found")
+
+    if input_path.is_file():
+        if input_path.suffix == ".csv" or input_path.suffix == ".tsv":
+            sep = "\t" if input_path.suffix == ".tsv" else ","
+            df = pandas.read_csv(input_path, sep=sep)
+            assert "id" in df.columns and "sequence" in df.columns
+            queries = [
+                (seq_id, sequence.upper().split(":"), None)
+                for seq_id, sequence in df[["id", "sequence"]].itertuples(index=False)
+            ]
+            for i in range(len(queries)):
+                if len(queries[i][1]) == 1:
+                    queries[i] = (queries[i][0], queries[i][1][0], None)
+        elif input_path.suffix == ".a3m":
+            (seqs, header) = parse_fasta(input_path.read_text())
+            if len(seqs) == 0:
+                raise ValueError(f"{input_path} is empty")
+            query_sequence = seqs[0]
+            # Use a list so we can easily extend this to multiple msas later
+            a3m_lines = [input_path.read_text()]
+            queries = [(input_path.stem, query_sequence, a3m_lines)]
+        elif input_path.suffix in [".fasta", ".faa", ".fa"]:
+            (sequences, headers) = parse_fasta(input_path.read_text())
+            queries = []
+            for sequence, header in zip(sequences, headers):
+                sequence = sequence.upper()
+                if sequence.count(":") == 0:
+                    # Single sequence
+                    queries.append((header, sequence, None))
+                else:
+                    # Complex mode
+                    queries.append((header, sequence.upper().split(":"), None))
+        else:
+            raise ValueError(f"Unknown file format {input_path.suffix}")
+    else:
+        assert input_path.is_dir(), "Expected either an input file or a input directory"
+        queries = []
+        for file in sorted(input_path.iterdir()):
+            if not file.is_file():
+                continue
+            if file.suffix.lower() not in [".a3m", ".fasta", ".faa"]:
+                logger.warning(f"non-fasta/a3m file in input directory: {file}")
+                continue
+            (seqs, header) = parse_fasta(file.read_text())
+            if len(seqs) == 0:
+                logger.error(f"{file} is empty")
+                continue
+            query_sequence = seqs[0]
+            if len(seqs) > 1 and file.suffix in [".fasta", ".faa", ".fa"]:
+                logger.warning(
+                    f"More than one sequence in {file}, ignoring all but the first sequence"
+                )
+
+            if file.suffix.lower() == ".a3m":
+                a3m_lines = [file.read_text()]
+                queries.append((file.stem, query_sequence.upper(), a3m_lines))
+            else:
+                if query_sequence.count(":") == 0:
+                    # Single sequence
+                    queries.append((file.stem, query_sequence, None))
+                else:
+                    # Complex mode
+                    queries.append((file.stem, query_sequence.upper().split(":"), None))
+
+    # sort by seq. len
+    if sort_queries_by == "length":
+        queries.sort(key=lambda t: len(t[1]))
+    elif sort_queries_by == "random":
+        random.shuffle(queries)
+    is_complex = False
+    for job_number, (raw_jobname, query_sequence, a3m_lines) in enumerate(queries):
+        if isinstance(query_sequence, list):
+            is_complex = True
+            break
+
+        if a3m_lines is not None and a3m_lines[0].startswith("#"):
+            a3m_line = a3m_lines[0].splitlines()[0]
+            tab_sep_entries = a3m_line[1:].split("\t")
+            if len(tab_sep_entries) == 2:
+                query_seq_len = tab_sep_entries[0].split(",")
+                query_seq_len = list(map(int, query_seq_len))
+                query_seqs_cardinality = tab_sep_entries[1].split(",")
+                query_seqs_cardinality = list(map(int, query_seqs_cardinality))
+                is_single_protein = (
+                    True
+                    if len(query_seq_len) == 1 and query_seqs_cardinality[0] == 1
+                    else False
+                )
+                if not is_single_protein:
+                    is_complex = True
+                    break
+
+    return queries, is_complex
+
+############
+# Step 2 helpers
+############
+
+def build_monomer_feature(
+    sequence: str, unpaired_msa: str, template_features: Dict[str, Any]
+):
+    msa = pipeline.parsers.parse_a3m(unpaired_msa)
+    # gather features
+    return {
+        **pipeline.make_sequence_features(
+            sequence=sequence, description="none", num_res=len(sequence)
+        ),
+        **pipeline.make_msa_features([msa]),
+        **template_features,
+    }
+
+def build_multimer_feature(paired_msa: str) -> Dict[str, ndarray]:
+    parsed_paired_msa = pipeline.parsers.parse_a3m(paired_msa)
+    return {
+        f"{k}_all_seq": v
+        for k, v in pipeline.make_msa_features([parsed_paired_msa]).items()
+    }
+
+def process_multimer_features(
+    features_for_chain: Dict[str, Dict[str, ndarray]]
+) -> Dict[str, ndarray]:
+    all_chain_features = {}
+    for chain_id, chain_features in features_for_chain.items():
+        all_chain_features[chain_id] = pipeline_multimer.convert_monomer_features(
+            chain_features, chain_id
+        )
+
+    all_chain_features = pipeline_multimer.add_assembly_features(all_chain_features)
+    # np_example = feature_processing.pair_and_merge(
+    #    all_chain_features=all_chain_features, is_prokaryote=is_prokaryote)
+    feature_processing.process_unmerged_features(all_chain_features)
+    np_chains_list = list(all_chain_features.values())
+    # noinspection PyProtectedMember
+    pair_msa_sequences = not feature_processing._is_homomer_or_monomer(np_chains_list)
+    chains = list(np_chains_list)
+    chain_keys = chains[0].keys()
+    updated_chains = []
+    for chain_num, chain in enumerate(chains):
+        new_chain = {k: v for k, v in chain.items() if "_all_seq" not in k}
+        for feature_name in chain_keys:
+            if feature_name.endswith("_all_seq"):
+                feats_padded = msa_pairing.pad_features(
+                    chain[feature_name], feature_name
+                )
+                new_chain[feature_name] = feats_padded
+        new_chain["num_alignments_all_seq"] = np.asarray(
+            len(np_chains_list[chain_num]["msa_all_seq"])
+        )
+        updated_chains.append(new_chain)
+    np_chains_list = updated_chains
+    np_chains_list = feature_processing.crop_chains(
+        np_chains_list,
+        msa_crop_size=feature_processing.MSA_CROP_SIZE,
+        pair_msa_sequences=pair_msa_sequences,
+        max_templates=feature_processing.MAX_TEMPLATES,
+    )
+    # merge_chain_features crashes if there are additional features only present in one chain
+    # remove all features that are not present in all chains
+    common_features = set([*np_chains_list[0]]).intersection(*np_chains_list)
+    np_chains_list = [
+        {key: value for (key, value) in chain.items() if key in common_features}
+        for chain in np_chains_list
+    ]
+    np_example = feature_processing.msa_pairing.merge_chain_features(
+        np_chains_list=np_chains_list,
+        pair_msa_sequences=pair_msa_sequences,
+        max_templates=feature_processing.MAX_TEMPLATES,
+    )
+    np_example = feature_processing.process_final(np_example)
+
+    # Pad MSA to avoid zero-sized extra_msa.
+    np_example = pipeline_multimer.pad_msa(np_example, min_num_seq=512)
+    return np_example
+
+############
+# Step 1 helpers
+############
+
+def pair_sequences(a3m_lines: List[str],
+                   query_sequences: List[str],
+                   query_cardinality: List[int]) -> str:
+
+    print('card', query_cardinality)
+
+    a3m_line_paired = [""] * len(a3m_lines[0].splitlines())
+    for n, seq in enumerate(query_sequences):
+        lines = a3m_lines[n].splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith(">"):
+                if n != 0:
+                    line = line.replace(">", "\t", 1)
+                a3m_line_paired[i] = a3m_line_paired[i] + line
+            else:
+                a3m_line_paired[i] = a3m_line_paired[i] + line * query_cardinality[n]
+    return "\n".join(a3m_line_paired)
+
+def pad_sequences(a3m_lines: List[str], query_sequences: List[str],
+                  query_cardinality: List[int]) -> str:
+    """ Pad all msa to be same length as query sequence.
+        If query is oligomer, msa doesn't need to be modified.
+        If query is dimer, msa for 1st seq is padded with '-' at location for 2nd seq
+                           msa for 2nd seq is padded with '-' at location for 1st seq
+    """
+    _blank_seq = [ ("-" * len(seq))
+                   for n, seq in enumerate(query_sequences)
+                   for _ in range(query_cardinality[n]) ]
+
+    pos, a3m_lines_combined = 0, []
+    for n, seq in enumerate(query_sequences):
+        for j in range(0, query_cardinality[n]):
+            lines = a3m_lines[n].split("\n")
+            for a3m_line in lines:
+                if len(a3m_line) == 0:
+                    continue
+                if a3m_line.startswith(">"):
+                    a3m_lines_combined.append(a3m_line)
+                else:
+                    a3m_lines_combined.append(
+                        "".join(_blank_seq[:pos] + [a3m_line] + _blank_seq[pos + 1 :]))
+            pos += 1
+
+    return "\n".join(a3m_lines_combined)
+
+def pair_msa(query_seqs_unique: List[str],
+             query_seqs_cardinality: List[int],
+             paired_msa: Optional[List[str]],
+             unpaired_msa: Optional[List[str]]) -> str:
+
+    if paired_msa is None and unpaired_msa is not None:
+        a3m_lines = pad_sequences(
+            unpaired_msa, query_seqs_unique, query_seqs_cardinality)
+        # print('^^^^^^^^^^^^^^^^')
+        # print(a3m_lines[:1000])
+
+    elif paired_msa is not None and unpaired_msa is not None:
+        a3m_lines = (
+            pair_sequences(paired_msa, query_seqs_unique, query_seqs_cardinality)
+            + "\n"
+            + pad_sequences(unpaired_msa, query_seqs_unique, query_seqs_cardinality))
+        # a3m_lines = pair_sequences(paired_msa, query_seqs_unique, query_seqs_cardinality)
+        # a3m_lines = pad_sequences(unpaired_msa, query_seqs_unique, query_seqs_cardinality)
+        # print('^^^^^^^^^^^^^^^^')
+        # print(a3m_lines[30000:32000])
+        # print(a3m_lines[:2000])
+
+    elif paired_msa is not None and unpaired_msa is None:
+        a3m_lines = pair_sequences(
+            paired_msa, query_seqs_unique, query_seqs_cardinality)
+    else:
+        raise ValueError(f"Invalid pairing")
+    return a3m_lines
+
+def msa_to_str(unpaired_msa: List[str], paired_msa: List[str], query_seqs_unique: List[str],
+               query_seqs_cardinality: List[int]) -> str:
+
+    msa = "#" + ",".join(map(str, map(len, query_seqs_unique))) + "\t"
+    msa += ",".join(map(str, query_seqs_cardinality)) + "\n"
+    # build msa with cardinality of 1, it makes it easier to parse and manipulate
+    query_seqs_cardinality = [1 for _ in query_seqs_cardinality]
+    msa += pair_msa(query_seqs_unique, query_seqs_cardinality, paired_msa, unpaired_msa)
+    return msa
+
+def str_to_msa(msa_fname):
+    file = open(msa_fname)
+
+    # read 1st line
+    line = file.readline()
+    segments = line[1:].split()
+    len1, len2 = segments[0].split(',')
+    len1 = int(len1)
+    len2 = int(len2)
+    segments1 = segments[1].split(',')
+    assert(len(segments1) == 2)
+    query_seqs_cardinality = [int(segments1[0])]
+    # print('*', len1, len2)
+
+    # read 2nd line
+    line = file.readline()
+    assert(line[0] == '>')
+    segments = line[1:].split()
+    assert(len(segments) == 2)
+    id1, id2 = segments
+    # print('*', id1, id2)
+
+    # read 3rd line
+    line = file.readline()
+    query_seqs_unique = [line[:-1]]
+
+    # form paired msa
+    paired_msa = [f">{id1}\n{query_seqs_unique[0]}\n"]
+
+    # read rest lines
+    lines = []
+    eof, first_half = False, True
+    while not eof:
+        line = file.readline()
+        if len(line) == 0:
+            eof = True
+        elif line[0] == ">":
+            if first_half and line[1:4] == id2:
+                first_half = False
+            lines.append(line[:-1])
+        elif first_half:
+            lines.append(line[:len1])
+        else:
+            lines.append(line[len1:-1])
+    unpaired_msa = "\n".join(lines)
+
+    return unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality
+
+def get_msa_and_templates(
+    jobname: str,
+    query_sequences: Union[str, List[str]],
+    result_dir: Path,
+    msa_mode: str,
+    use_templates: bool,
+    custom_template_path: str,
+    pair_mode: str,
+    host_url: str = DEFAULT_API_SERVER,
+) -> Tuple[
+    Optional[List[str]], Optional[List[str]], List[str], List[int], List[Dict[str, Any]]
+]:
+    from colabfold.colabfold import run_mmseqs2
+
+    use_env = msa_mode == "MMseqs2 (UniRef+Environmental)"
+    # remove duplicates before searching
+    query_sequences = (
+        [query_sequences] if isinstance(query_sequences, str) else query_sequences
+    )
+    query_seqs_unique = []
+    for x in query_sequences:
+        if x not in query_seqs_unique:
+            query_seqs_unique.append(x)
+    query_seqs_cardinality = [0] * len(query_seqs_unique)
+    for seq in query_sequences:
+        seq_idx = query_seqs_unique.index(seq)
+        query_seqs_cardinality[seq_idx] += 1
+
+    template_features = []
+    if use_templates:
+        a3m_lines_mmseqs2, template_paths = run_mmseqs2(
+            query_seqs_unique,
+            str(result_dir.joinpath(jobname)),
+            use_env,
+            use_templates=True,
+            host_url=host_url,
+        )
+        if custom_template_path is not None:
+            template_paths = {}
+            for index in range(0, len(query_seqs_unique)):
+                template_paths[index] = custom_template_path
+        if template_paths is None:
+            logger.info("No template detected")
+            for index in range(0, len(query_seqs_unique)):
+                template_feature = mk_mock_template(query_seqs_unique[index])
+                template_features.append(template_feature)
+        else:
+            for index in range(0, len(query_seqs_unique)):
+                if template_paths[index] is not None:
+                    template_feature = mk_template(
+                        a3m_lines_mmseqs2[index],
+                        template_paths[index],
+                        query_seqs_unique[index],
+                    )
+                    if len(template_feature["template_domain_names"]) == 0:
+                        template_feature = mk_mock_template(query_seqs_unique[index])
+                        logger.info(f"Sequence {index} found no templates")
+                    else:
+                        logger.info(
+                            f"Sequence {index} found templates: {template_feature['template_domain_names'].astype(str).tolist()}"
+                        )
+                else:
+                    template_feature = mk_mock_template(query_seqs_unique[index])
+                    logger.info(f"Sequence {index} found no templates")
+
+                template_features.append(template_feature)
+    else:
+        for index in range(0, len(query_seqs_unique)):
+            template_feature = mk_mock_template(query_seqs_unique[index])
+            template_features.append(template_feature)
+
+    if len(query_sequences) == 1:
+        pair_mode = "none"
+
+    if pair_mode == "none" or pair_mode == "unpaired" or pair_mode == "unpaired+paired":
+        print(f"**** When retriving MSA, msa mode is {msa_mode}")
+
+        if msa_mode == "single_sequence":
+            print("Don't run mmseqs2")
+            a3m_lines = []
+            num = 101
+            for i, seq in enumerate(query_seqs_unique):
+                a3m_lines.append(">" + str(num + i) + "\n" + seq)
+        else:
+            # find normal a3ms
+            print("Run mmseqs2")
+            a3m_lines = run_mmseqs2(
+                query_seqs_unique,
+                str(result_dir.joinpath(jobname)),
+                use_env,
+                use_pairing=False,
+                host_url=host_url,
+            )
+    else:
+        a3m_lines = None
+
+    if msa_mode != "single_sequence" and (
+        pair_mode == "paired" or pair_mode == "unpaired+paired"
+    ):
+        # find paired a3m if not a homooligomers
+        if len(query_seqs_unique) > 1:
+            paired_a3m_lines = run_mmseqs2(
+                query_seqs_unique,
+                str(result_dir.joinpath(jobname)),
+                use_env,
+                use_pairing=True,
+                host_url=host_url)
+        else: # homooligomers
+            num = 101
+            paired_a3m_lines = []
+            for i in range(0, query_seqs_cardinality[0]):
+                paired_a3m_lines.append(
+                    ">" + str(num + i) + "\n" + query_seqs_unique[0] + "\n")
+    else:
+        paired_a3m_lines = None
+
+    return (
+        a3m_lines,
+        paired_a3m_lines,
+        query_seqs_unique,
+        query_seqs_cardinality,
+        template_features,
+    )
+
+def unserialize_msa(a3m_lines: List[str], query_sequence: Union[List[str], str]) -> Tuple[
+        Optional[List[str]], Optional[List[str]], List[str], List[int], List[Dict[str, Any]]]:
+
+    a3m_lines = a3m_lines[0].replace("\x00", "").splitlines()
+    if not a3m_lines[0].startswith("#") or len(a3m_lines[0][1:].split("\t")) != 2:
+        assert isinstance(query_sequence, str)
+        return (
+            ["\n".join(a3m_lines)],
+            None,
+            [query_sequence],
+            [1],
+            [mk_mock_template(query_sequence)],
+        )
+
+    if len(a3m_lines) < 3:
+        raise ValueError(f"Unknown file format a3m")
+    tab_sep_entries = a3m_lines[0][1:].split("\t")
+    query_seq_len = tab_sep_entries[0].split(",")
+    query_seq_len = list(map(int, query_seq_len))
+    query_seqs_cardinality = tab_sep_entries[1].split(",")
+    query_seqs_cardinality = list(map(int, query_seqs_cardinality))
+    is_homooligomer = (
+        True if len(query_seq_len) == 1 and query_seqs_cardinality[0] > 1 else False
+    )
+    is_single_protein = (
+        True if len(query_seq_len) == 1 and query_seqs_cardinality[0] == 1 else False
+    )
+    query_seqs_unique = []
+    prev_query_start = 0
+    # we store the a3m with cardinality of 1
+    for n, query_len in enumerate(query_seq_len):
+        query_seqs_unique.append(
+            a3m_lines[2][prev_query_start : prev_query_start + query_len]
+        )
+        prev_query_start += query_len
+    paired_msa = [""] * len(query_seq_len)
+    unpaired_msa = [""] * len(query_seq_len)
+    already_in = dict()
+    for i in range(1, len(a3m_lines), 2):
+        header = a3m_lines[i]
+        seq = a3m_lines[i + 1]
+        if (header, seq) in already_in:
+            continue
+        already_in[(header, seq)] = 1
+        has_amino_acid = [False] * len(query_seq_len)
+        seqs_line = []
+        prev_pos = 0
+        for n, query_len in enumerate(query_seq_len):
+            paired_seq = ""
+            curr_seq_len = 0
+            for pos in range(prev_pos, len(seq)):
+                if curr_seq_len == query_len:
+                    prev_pos = pos
+                    break
+                paired_seq += seq[pos]
+                if seq[pos].islower():
+                    continue
+                if seq[pos] != "-":
+                    has_amino_acid[n] = True
+                curr_seq_len += 1
+            seqs_line.append(paired_seq)
+
+        # is sequence is paired add them to output
+        if (
+            not is_single_protein
+            and not is_homooligomer
+            and sum(has_amino_acid) == len(query_seq_len)
+        ):
+            header_no_faster = header.replace(">", "")
+            header_no_faster_split = header_no_faster.split("\t")
+            for j in range(0, len(seqs_line)):
+                paired_msa[j] += ">" + header_no_faster_split[j] + "\n"
+                paired_msa[j] += seqs_line[j] + "\n"
+        else:
+            for j, seq in enumerate(seqs_line):
+                if has_amino_acid[j]:
+                    unpaired_msa[j] += header + "\n"
+                    unpaired_msa[j] += seq + "\n"
+    if is_homooligomer:
+        # homooligomers
+        num = 101
+        paired_msa = [""] * query_seqs_cardinality[0]
+        for i in range(0, query_seqs_cardinality[0]):
+            paired_msa[i] = ">" + str(num + i) + "\n" + query_seqs_unique[0] + "\n"
+    if is_single_protein:
+        paired_msa = None
+    template_features = []
+    for query_seq in query_seqs_unique:
+        template_feature = mk_mock_template(query_seq)
+        template_features.append(template_feature)
+
+    return (
+        unpaired_msa,
+        paired_msa,
+        query_seqs_unique,
+        query_seqs_cardinality,
+        template_features,
+    )
+
+#########
+# Step 1
+#########
+
+def generate_msa(cur_result_dir, raw_jobname, jobname, use_templates, a3m_lines,
+                 query_sequence, msa_mode, custom_template_path, pair_mode, host_url):
+
+    """ Generate msa on the fly or read from local cache.
+    """
+    load_cache = False
+    a3m_fname = join(cur_result_dir, f"{raw_jobname}.a3m")
+    template_feat_fname = join(cur_result_dir, f"{raw_jobname}_template_feats.txt")
+
+    if exists(a3m_fname) and exists(template_feat_fname):
+        # read from local cache
+        load_cache = True
+        unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality = \
+            str_to_msa(a3m_fname)
+
+        with open(template_feat_fname, "rb") as fp:
+            template_features = pickle.load(fp)
+
+    elif a3m_lines is not None:
+        if use_templates is False:
+            (unpaired_msa, paired_msa, query_seqs_unique,
+             query_seqs_cardinality, template_features) = \
+                 unserialize_msa(a3m_lines, query_sequence)
+        else:
+            (unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality) = \
+                unserialize_msa(a3m_lines, query_sequence)[:4]
+
+            template_features = get_msa_and_templates(
+                jobname, query_sequence, cur_result_dir, msa_mode, use_templates,
+                custom_template_path, pair_mode, host_url)[4]
+    else:
+        unpaired_msa, paired_msa, query_seqs_unique, \
+            query_seqs_cardinality, template_features = get_msa_and_templates(
+                jobname, query_sequence, cur_result_dir, msa_mode,
+                use_templates, custom_template_path, pair_mode, host_url)
+
+    # print(query_sequence)
+    # print('*********')
+    # print(query_seqs_unique)
+    # print(query_seqs_cardinality)
+    # print(len(unpaired_msa), type(unpaired_msa[0]))
+    # print(unpaired_msa[0][30000:32000])
+    # print('*********')
+    # print(unpaired_msa[1][10000:12000])
+    # print(len(unpaired_msa[0]), len(unpaired_msa[1]))
+    # print('*********')
+
+    # print(paired_msa)
+    # print(len(paired_msa[0]), len(paired_msa[1]))
+    # print('*********')
+
+    if not load_cache:
+        msa = msa_to_str(unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality)
+        cur_result_dir.joinpath(jobname + ".a3m").write_text(msa)
+
+        with open(template_feat_fname, "wb") as fp:
+            pickle.dump(template_features, fp)
+
+    return unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality, template_features
+
+##########
+# Step 2
+##########
+
+def generate_input_feature(
+    query_seqs_unique: List[str],
+    query_seqs_cardinality: List[int],
+    unpaired_msa: List[str],
+    paired_msa: List[str],
+    template_features: List[Dict[str, Any]],
+    is_complex: bool,
+    model_type: str,
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    from colabfold.colabfold import chain_break
+
+    input_feature = {}
+    domain_names = {}
+    if is_complex and model_type == "AlphaFold2-ptm":
+        a3m_lines = pair_msa(
+            query_seqs_unique, query_seqs_cardinality, paired_msa, unpaired_msa
+        )
+        total_sequence = ""
+        Ls = []
+        for sequence_index, sequence in enumerate(query_seqs_unique):
+            for cardinality in range(0, query_seqs_cardinality[sequence_index]):
+                total_sequence += sequence
+                Ls.append(len(sequence))
+
+        input_feature = build_monomer_feature(
+            total_sequence, a3m_lines, mk_mock_template(total_sequence)
+        )
+        input_feature["residue_index"] = chain_break(input_feature["residue_index"], Ls)
+        input_feature["asym_id"] = np.array(
+            [int(n) for n, l in enumerate(Ls) for _ in range(0, l)]
+        )
+        if any(
+            [
+                template != b"none"
+                for i in template_features
+                for template in i["template_domain_names"]
+            ]
+        ):
+            logger.warning(
+                "AlphaFold2-ptm complex does not consider templates. Chose multimer model-type for template support."
+            )
+    else:
+        features_for_chain = {}
+        chain_cnt = 0
+        for sequence_index, sequence in enumerate(query_seqs_unique):
+            for cardinality in range(0, query_seqs_cardinality[sequence_index]):
+                if unpaired_msa is None:
+                    input_msa = ">" + str(101 + sequence_index) + "\n" + sequence
+                else:
+                    input_msa = unpaired_msa[sequence_index]
+
+                feature_dict = build_monomer_feature(
+                    sequence, input_msa, template_features[sequence_index]
+                )
+                if is_complex:
+                    if paired_msa is None:
+                        input_msa = ">" + str(101 + sequence_index) + "\n" + sequence
+                    else:
+                        input_msa = paired_msa[sequence_index]
+
+                    all_seq_features = build_multimer_feature(input_msa)
+                    feature_dict.update(all_seq_features)
+
+                features_for_chain[protein.PDB_CHAIN_IDS[chain_cnt]] = feature_dict
+                chain_cnt += 1
+
+        # Do further feature post-processing depending on the model type.
+        if not is_complex:
+            input_feature = features_for_chain[protein.PDB_CHAIN_IDS[0]]
+            domain_names = {
+                protein.PDB_CHAIN_IDS[0]: [
+                    name.decode("UTF-8")
+                    for name in input_feature["template_domain_names"]
+                    if name != b"none"
+                ]
+            }
+        elif model_type.startswith("AlphaFold2-multimer"):
+            input_feature = process_multimer_features(features_for_chain)
+            domain_names = {
+                chain: [
+                    name.decode("UTF-8")
+                    for name in feature["template_domain_names"]
+                    if name != b"none"
+                ]
+                for (chain, feature) in features_for_chain.items()
+            }
+        elif is_complex and model_type == "AlphaFold2-ptm":
+            domain_names = {protein.PDB_CHAIN_IDS[0]: []}
+    return (input_feature, domain_names)
+
+##########
+# Step 3
+##########
 
 def predict_structure(
     prefix: str,
@@ -589,679 +1322,9 @@ def predict_structure(
 
     return out, model_rank
 
-
-def parse_fasta(fasta_string: str) -> Tuple[List[str], List[str]]:
-    """Parses FASTA string and returns list of strings with amino-acid sequences.
-
-    Arguments:
-      fasta_string: The string contents of a FASTA file.
-
-    Returns:
-      A tuple of two lists:
-      * A list of sequences.
-      * A list of sequence descriptions taken from the comment lines. In the
-        same order as the sequences.
-    """
-    sequences = []
-    descriptions = []
-    index = -1
-    for line in fasta_string.splitlines():
-        line = line.strip()
-        if line.startswith("#"):
-            continue
-        if line.startswith(">"):
-            index += 1
-            descriptions.append(line[1:])  # Remove the '>' at the beginning.
-            sequences.append("")
-            continue
-        elif not line:
-            continue  # Skip blank lines.
-        sequences[index] += line
-
-    return sequences, descriptions
-
-
-def get_queries(
-    input_path: Union[str, Path], sort_queries_by: str = "length"
-) -> Tuple[List[Tuple[str, str, Optional[List[str]]]], bool]:
-    """Reads a directory of fasta files, a single fasta file or a csv file and returns a tuple
-    of job name, sequence and the optional a3m lines"""
-
-    input_path = Path(input_path)
-    if not input_path.exists():
-        raise OSError(f"{input_path} could not be found")
-
-    if input_path.is_file():
-        if input_path.suffix == ".csv" or input_path.suffix == ".tsv":
-            sep = "\t" if input_path.suffix == ".tsv" else ","
-            df = pandas.read_csv(input_path, sep=sep)
-            assert "id" in df.columns and "sequence" in df.columns
-            queries = [
-                (seq_id, sequence.upper().split(":"), None)
-                for seq_id, sequence in df[["id", "sequence"]].itertuples(index=False)
-            ]
-            for i in range(len(queries)):
-                if len(queries[i][1]) == 1:
-                    queries[i] = (queries[i][0], queries[i][1][0], None)
-        elif input_path.suffix == ".a3m":
-            (seqs, header) = parse_fasta(input_path.read_text())
-            if len(seqs) == 0:
-                raise ValueError(f"{input_path} is empty")
-            query_sequence = seqs[0]
-            # Use a list so we can easily extend this to multiple msas later
-            a3m_lines = [input_path.read_text()]
-            queries = [(input_path.stem, query_sequence, a3m_lines)]
-        elif input_path.suffix in [".fasta", ".faa", ".fa"]:
-            (sequences, headers) = parse_fasta(input_path.read_text())
-            queries = []
-            for sequence, header in zip(sequences, headers):
-                sequence = sequence.upper()
-                if sequence.count(":") == 0:
-                    # Single sequence
-                    queries.append((header, sequence, None))
-                else:
-                    # Complex mode
-                    queries.append((header, sequence.upper().split(":"), None))
-        else:
-            raise ValueError(f"Unknown file format {input_path.suffix}")
-    else:
-        assert input_path.is_dir(), "Expected either an input file or a input directory"
-        queries = []
-        for file in sorted(input_path.iterdir()):
-            if not file.is_file():
-                continue
-            if file.suffix.lower() not in [".a3m", ".fasta", ".faa"]:
-                logger.warning(f"non-fasta/a3m file in input directory: {file}")
-                continue
-            (seqs, header) = parse_fasta(file.read_text())
-            if len(seqs) == 0:
-                logger.error(f"{file} is empty")
-                continue
-            query_sequence = seqs[0]
-            if len(seqs) > 1 and file.suffix in [".fasta", ".faa", ".fa"]:
-                logger.warning(
-                    f"More than one sequence in {file}, ignoring all but the first sequence"
-                )
-
-            if file.suffix.lower() == ".a3m":
-                a3m_lines = [file.read_text()]
-                queries.append((file.stem, query_sequence.upper(), a3m_lines))
-            else:
-                if query_sequence.count(":") == 0:
-                    # Single sequence
-                    queries.append((file.stem, query_sequence, None))
-                else:
-                    # Complex mode
-                    queries.append((file.stem, query_sequence.upper().split(":"), None))
-
-    # sort by seq. len
-    if sort_queries_by == "length":
-        queries.sort(key=lambda t: len(t[1]))
-    elif sort_queries_by == "random":
-        random.shuffle(queries)
-    is_complex = False
-    for job_number, (raw_jobname, query_sequence, a3m_lines) in enumerate(queries):
-        if isinstance(query_sequence, list):
-            is_complex = True
-            break
-
-        if a3m_lines is not None and a3m_lines[0].startswith("#"):
-            a3m_line = a3m_lines[0].splitlines()[0]
-            tab_sep_entries = a3m_line[1:].split("\t")
-            if len(tab_sep_entries) == 2:
-                query_seq_len = tab_sep_entries[0].split(",")
-                query_seq_len = list(map(int, query_seq_len))
-                query_seqs_cardinality = tab_sep_entries[1].split(",")
-                query_seqs_cardinality = list(map(int, query_seqs_cardinality))
-                is_single_protein = (
-                    True
-                    if len(query_seq_len) == 1 and query_seqs_cardinality[0] == 1
-                    else False
-                )
-                if not is_single_protein:
-                    is_complex = True
-                    break
-
-    return queries, is_complex
-
-
-def pair_sequences(
-    a3m_lines: List[str], query_sequences: List[str], query_cardinality: List[int]
-) -> str:
-    a3m_line_paired = [""] * len(a3m_lines[0].splitlines())
-    for n, seq in enumerate(query_sequences):
-        lines = a3m_lines[n].splitlines()
-        for i, line in enumerate(lines):
-            if line.startswith(">"):
-                if n != 0:
-                    line = line.replace(">", "\t", 1)
-                a3m_line_paired[i] = a3m_line_paired[i] + line
-            else:
-                a3m_line_paired[i] = a3m_line_paired[i] + line * query_cardinality[n]
-    return "\n".join(a3m_line_paired)
-
-
-def pad_sequences(
-    a3m_lines: List[str], query_sequences: List[str], query_cardinality: List[int]
-) -> str:
-    _blank_seq = [
-        ("-" * len(seq))
-        for n, seq in enumerate(query_sequences)
-        for _ in range(query_cardinality[n])
-    ]
-    a3m_lines_combined = []
-    pos = 0
-    for n, seq in enumerate(query_sequences):
-        for j in range(0, query_cardinality[n]):
-            lines = a3m_lines[n].split("\n")
-            for a3m_line in lines:
-                if len(a3m_line) == 0:
-                    continue
-                if a3m_line.startswith(">"):
-                    a3m_lines_combined.append(a3m_line)
-                else:
-                    a3m_lines_combined.append(
-                        "".join(_blank_seq[:pos] + [a3m_line] + _blank_seq[pos + 1 :])
-                    )
-            pos += 1
-    return "\n".join(a3m_lines_combined)
-
-
-def get_msa_and_templates(
-    jobname: str,
-    query_sequences: Union[str, List[str]],
-    result_dir: Path,
-    msa_mode: str,
-    use_templates: bool,
-    custom_template_path: str,
-    pair_mode: str,
-    host_url: str = DEFAULT_API_SERVER,
-) -> Tuple[
-    Optional[List[str]], Optional[List[str]], List[str], List[int], List[Dict[str, Any]]
-]:
-    from colabfold.colabfold import run_mmseqs2
-
-    use_env = msa_mode == "MMseqs2 (UniRef+Environmental)"
-    # remove duplicates before searching
-    query_sequences = (
-        [query_sequences] if isinstance(query_sequences, str) else query_sequences
-    )
-    query_seqs_unique = []
-    for x in query_sequences:
-        if x not in query_seqs_unique:
-            query_seqs_unique.append(x)
-    query_seqs_cardinality = [0] * len(query_seqs_unique)
-    for seq in query_sequences:
-        seq_idx = query_seqs_unique.index(seq)
-        query_seqs_cardinality[seq_idx] += 1
-
-    template_features = []
-    if use_templates:
-        a3m_lines_mmseqs2, template_paths = run_mmseqs2(
-            query_seqs_unique,
-            str(result_dir.joinpath(jobname)),
-            use_env,
-            use_templates=True,
-            host_url=host_url,
-        )
-        if custom_template_path is not None:
-            template_paths = {}
-            for index in range(0, len(query_seqs_unique)):
-                template_paths[index] = custom_template_path
-        if template_paths is None:
-            logger.info("No template detected")
-            for index in range(0, len(query_seqs_unique)):
-                template_feature = mk_mock_template(query_seqs_unique[index])
-                template_features.append(template_feature)
-        else:
-            for index in range(0, len(query_seqs_unique)):
-                if template_paths[index] is not None:
-                    template_feature = mk_template(
-                        a3m_lines_mmseqs2[index],
-                        template_paths[index],
-                        query_seqs_unique[index],
-                    )
-                    if len(template_feature["template_domain_names"]) == 0:
-                        template_feature = mk_mock_template(query_seqs_unique[index])
-                        logger.info(f"Sequence {index} found no templates")
-                    else:
-                        logger.info(
-                            f"Sequence {index} found templates: {template_feature['template_domain_names'].astype(str).tolist()}"
-                        )
-                else:
-                    template_feature = mk_mock_template(query_seqs_unique[index])
-                    logger.info(f"Sequence {index} found no templates")
-
-                template_features.append(template_feature)
-    else:
-        for index in range(0, len(query_seqs_unique)):
-            template_feature = mk_mock_template(query_seqs_unique[index])
-            template_features.append(template_feature)
-
-    if len(query_sequences) == 1:
-        pair_mode = "none"
-
-    if pair_mode == "none" or pair_mode == "unpaired" or pair_mode == "unpaired+paired":
-        print(f"**** When retriving MSA, msa mode is {msa_mode}")
-
-        if msa_mode == "single_sequence":
-            print("Don't run mmseqs2")
-            a3m_lines = []
-            num = 101
-            for i, seq in enumerate(query_seqs_unique):
-                a3m_lines.append(">" + str(num + i) + "\n" + seq)
-        else:
-            # find normal a3ms
-            print("Run mmseqs2")
-            a3m_lines = run_mmseqs2(
-                query_seqs_unique,
-                str(result_dir.joinpath(jobname)),
-                use_env,
-                use_pairing=False,
-                host_url=host_url,
-            )
-    else:
-        a3m_lines = None
-
-    if msa_mode != "single_sequence" and (
-        pair_mode == "paired" or pair_mode == "unpaired+paired"
-    ):
-        # find paired a3m if not a homooligomers
-        if len(query_seqs_unique) > 1:
-            paired_a3m_lines = run_mmseqs2(
-                query_seqs_unique,
-                str(result_dir.joinpath(jobname)),
-                use_env,
-                use_pairing=True,
-                host_url=host_url,
-            )
-        else:
-            # homooligomers
-            num = 101
-            paired_a3m_lines = []
-            for i in range(0, query_seqs_cardinality[0]):
-                paired_a3m_lines.append(
-                    ">" + str(num + i) + "\n" + query_seqs_unique[0] + "\n"
-                )
-    else:
-        paired_a3m_lines = None
-
-    return (
-        a3m_lines,
-        paired_a3m_lines,
-        query_seqs_unique,
-        query_seqs_cardinality,
-        template_features,
-    )
-
-
-def build_monomer_feature(
-    sequence: str, unpaired_msa: str, template_features: Dict[str, Any]
-):
-    msa = pipeline.parsers.parse_a3m(unpaired_msa)
-    # gather features
-    return {
-        **pipeline.make_sequence_features(
-            sequence=sequence, description="none", num_res=len(sequence)
-        ),
-        **pipeline.make_msa_features([msa]),
-        **template_features,
-    }
-
-
-def build_multimer_feature(paired_msa: str) -> Dict[str, ndarray]:
-    parsed_paired_msa = pipeline.parsers.parse_a3m(paired_msa)
-    return {
-        f"{k}_all_seq": v
-        for k, v in pipeline.make_msa_features([parsed_paired_msa]).items()
-    }
-
-
-def process_multimer_features(
-    features_for_chain: Dict[str, Dict[str, ndarray]]
-) -> Dict[str, ndarray]:
-    all_chain_features = {}
-    for chain_id, chain_features in features_for_chain.items():
-        all_chain_features[chain_id] = pipeline_multimer.convert_monomer_features(
-            chain_features, chain_id
-        )
-
-    all_chain_features = pipeline_multimer.add_assembly_features(all_chain_features)
-    # np_example = feature_processing.pair_and_merge(
-    #    all_chain_features=all_chain_features, is_prokaryote=is_prokaryote)
-    feature_processing.process_unmerged_features(all_chain_features)
-    np_chains_list = list(all_chain_features.values())
-    # noinspection PyProtectedMember
-    pair_msa_sequences = not feature_processing._is_homomer_or_monomer(np_chains_list)
-    chains = list(np_chains_list)
-    chain_keys = chains[0].keys()
-    updated_chains = []
-    for chain_num, chain in enumerate(chains):
-        new_chain = {k: v for k, v in chain.items() if "_all_seq" not in k}
-        for feature_name in chain_keys:
-            if feature_name.endswith("_all_seq"):
-                feats_padded = msa_pairing.pad_features(
-                    chain[feature_name], feature_name
-                )
-                new_chain[feature_name] = feats_padded
-        new_chain["num_alignments_all_seq"] = np.asarray(
-            len(np_chains_list[chain_num]["msa_all_seq"])
-        )
-        updated_chains.append(new_chain)
-    np_chains_list = updated_chains
-    np_chains_list = feature_processing.crop_chains(
-        np_chains_list,
-        msa_crop_size=feature_processing.MSA_CROP_SIZE,
-        pair_msa_sequences=pair_msa_sequences,
-        max_templates=feature_processing.MAX_TEMPLATES,
-    )
-    # merge_chain_features crashes if there are additional features only present in one chain
-    # remove all features that are not present in all chains
-    common_features = set([*np_chains_list[0]]).intersection(*np_chains_list)
-    np_chains_list = [
-        {key: value for (key, value) in chain.items() if key in common_features}
-        for chain in np_chains_list
-    ]
-    np_example = feature_processing.msa_pairing.merge_chain_features(
-        np_chains_list=np_chains_list,
-        pair_msa_sequences=pair_msa_sequences,
-        max_templates=feature_processing.MAX_TEMPLATES,
-    )
-    np_example = feature_processing.process_final(np_example)
-
-    # Pad MSA to avoid zero-sized extra_msa.
-    np_example = pipeline_multimer.pad_msa(np_example, min_num_seq=512)
-    return np_example
-
-
-def pair_msa(
-    query_seqs_unique: List[str],
-    query_seqs_cardinality: List[int],
-    paired_msa: Optional[List[str]],
-    unpaired_msa: Optional[List[str]],
-) -> str:
-    if paired_msa is None and unpaired_msa is not None:
-        a3m_lines = pad_sequences(
-            unpaired_msa, query_seqs_unique, query_seqs_cardinality
-        )
-    elif paired_msa is not None and unpaired_msa is not None:
-        a3m_lines = (
-            pair_sequences(paired_msa, query_seqs_unique, query_seqs_cardinality)
-            + "\n"
-            + pad_sequences(unpaired_msa, query_seqs_unique, query_seqs_cardinality)
-        )
-    elif paired_msa is not None and unpaired_msa is None:
-        a3m_lines = pair_sequences(
-            paired_msa, query_seqs_unique, query_seqs_cardinality
-        )
-    else:
-        raise ValueError(f"Invalid pairing")
-    return a3m_lines
-
-
-def generate_input_feature(
-    query_seqs_unique: List[str],
-    query_seqs_cardinality: List[int],
-    unpaired_msa: List[str],
-    paired_msa: List[str],
-    template_features: List[Dict[str, Any]],
-    is_complex: bool,
-    model_type: str,
-) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    from colabfold.colabfold import chain_break
-
-    input_feature = {}
-    domain_names = {}
-    if is_complex and model_type == "AlphaFold2-ptm":
-        a3m_lines = pair_msa(
-            query_seqs_unique, query_seqs_cardinality, paired_msa, unpaired_msa
-        )
-        total_sequence = ""
-        Ls = []
-        for sequence_index, sequence in enumerate(query_seqs_unique):
-            for cardinality in range(0, query_seqs_cardinality[sequence_index]):
-                total_sequence += sequence
-                Ls.append(len(sequence))
-
-        input_feature = build_monomer_feature(
-            total_sequence, a3m_lines, mk_mock_template(total_sequence)
-        )
-        input_feature["residue_index"] = chain_break(input_feature["residue_index"], Ls)
-        input_feature["asym_id"] = np.array(
-            [int(n) for n, l in enumerate(Ls) for _ in range(0, l)]
-        )
-        if any(
-            [
-                template != b"none"
-                for i in template_features
-                for template in i["template_domain_names"]
-            ]
-        ):
-            logger.warning(
-                "AlphaFold2-ptm complex does not consider templates. Chose multimer model-type for template support."
-            )
-    else:
-        features_for_chain = {}
-        chain_cnt = 0
-        for sequence_index, sequence in enumerate(query_seqs_unique):
-            for cardinality in range(0, query_seqs_cardinality[sequence_index]):
-                if unpaired_msa is None:
-                    input_msa = ">" + str(101 + sequence_index) + "\n" + sequence
-                else:
-                    input_msa = unpaired_msa[sequence_index]
-
-                feature_dict = build_monomer_feature(
-                    sequence, input_msa, template_features[sequence_index]
-                )
-                if is_complex:
-                    if paired_msa is None:
-                        input_msa = ">" + str(101 + sequence_index) + "\n" + sequence
-                    else:
-                        input_msa = paired_msa[sequence_index]
-
-                    all_seq_features = build_multimer_feature(input_msa)
-                    feature_dict.update(all_seq_features)
-
-                features_for_chain[protein.PDB_CHAIN_IDS[chain_cnt]] = feature_dict
-                chain_cnt += 1
-
-        # Do further feature post-processing depending on the model type.
-        if not is_complex:
-            input_feature = features_for_chain[protein.PDB_CHAIN_IDS[0]]
-            domain_names = {
-                protein.PDB_CHAIN_IDS[0]: [
-                    name.decode("UTF-8")
-                    for name in input_feature["template_domain_names"]
-                    if name != b"none"
-                ]
-            }
-        elif model_type.startswith("AlphaFold2-multimer"):
-            input_feature = process_multimer_features(features_for_chain)
-            domain_names = {
-                chain: [
-                    name.decode("UTF-8")
-                    for name in feature["template_domain_names"]
-                    if name != b"none"
-                ]
-                for (chain, feature) in features_for_chain.items()
-            }
-        elif is_complex and model_type == "AlphaFold2-ptm":
-            domain_names = {protein.PDB_CHAIN_IDS[0]: []}
-    return (input_feature, domain_names)
-
-
-def unserialize_msa(
-    a3m_lines: List[str], query_sequence: Union[List[str], str]
-) -> Tuple[
-    Optional[List[str]],
-    Optional[List[str]],
-    List[str],
-    List[int],
-    List[Dict[str, Any]],
-]:
-    a3m_lines = a3m_lines[0].replace("\x00", "").splitlines()
-    if not a3m_lines[0].startswith("#") or len(a3m_lines[0][1:].split("\t")) != 2:
-        assert isinstance(query_sequence, str)
-        return (
-            ["\n".join(a3m_lines)],
-            None,
-            [query_sequence],
-            [1],
-            [mk_mock_template(query_sequence)],
-        )
-
-    if len(a3m_lines) < 3:
-        raise ValueError(f"Unknown file format a3m")
-    tab_sep_entries = a3m_lines[0][1:].split("\t")
-    query_seq_len = tab_sep_entries[0].split(",")
-    query_seq_len = list(map(int, query_seq_len))
-    query_seqs_cardinality = tab_sep_entries[1].split(",")
-    query_seqs_cardinality = list(map(int, query_seqs_cardinality))
-    is_homooligomer = (
-        True if len(query_seq_len) == 1 and query_seqs_cardinality[0] > 1 else False
-    )
-    is_single_protein = (
-        True if len(query_seq_len) == 1 and query_seqs_cardinality[0] == 1 else False
-    )
-    query_seqs_unique = []
-    prev_query_start = 0
-    # we store the a3m with cardinality of 1
-    for n, query_len in enumerate(query_seq_len):
-        query_seqs_unique.append(
-            a3m_lines[2][prev_query_start : prev_query_start + query_len]
-        )
-        prev_query_start += query_len
-    paired_msa = [""] * len(query_seq_len)
-    unpaired_msa = [""] * len(query_seq_len)
-    already_in = dict()
-    for i in range(1, len(a3m_lines), 2):
-        header = a3m_lines[i]
-        seq = a3m_lines[i + 1]
-        if (header, seq) in already_in:
-            continue
-        already_in[(header, seq)] = 1
-        has_amino_acid = [False] * len(query_seq_len)
-        seqs_line = []
-        prev_pos = 0
-        for n, query_len in enumerate(query_seq_len):
-            paired_seq = ""
-            curr_seq_len = 0
-            for pos in range(prev_pos, len(seq)):
-                if curr_seq_len == query_len:
-                    prev_pos = pos
-                    break
-                paired_seq += seq[pos]
-                if seq[pos].islower():
-                    continue
-                if seq[pos] != "-":
-                    has_amino_acid[n] = True
-                curr_seq_len += 1
-            seqs_line.append(paired_seq)
-
-        # is sequence is paired add them to output
-        if (
-            not is_single_protein
-            and not is_homooligomer
-            and sum(has_amino_acid) == len(query_seq_len)
-        ):
-            header_no_faster = header.replace(">", "")
-            header_no_faster_split = header_no_faster.split("\t")
-            for j in range(0, len(seqs_line)):
-                paired_msa[j] += ">" + header_no_faster_split[j] + "\n"
-                paired_msa[j] += seqs_line[j] + "\n"
-        else:
-            for j, seq in enumerate(seqs_line):
-                if has_amino_acid[j]:
-                    unpaired_msa[j] += header + "\n"
-                    unpaired_msa[j] += seq + "\n"
-    if is_homooligomer:
-        # homooligomers
-        num = 101
-        paired_msa = [""] * query_seqs_cardinality[0]
-        for i in range(0, query_seqs_cardinality[0]):
-            paired_msa[i] = ">" + str(num + i) + "\n" + query_seqs_unique[0] + "\n"
-    if is_single_protein:
-        paired_msa = None
-    template_features = []
-    for query_seq in query_seqs_unique:
-        template_feature = mk_mock_template(query_seq)
-        template_features.append(template_feature)
-
-    return (
-        unpaired_msa,
-        paired_msa,
-        query_seqs_unique,
-        query_seqs_cardinality,
-        template_features,
-    )
-
-
-def msa_to_str(
-    unpaired_msa: List[str],
-    paired_msa: List[str],
-    query_seqs_unique: List[str],
-    query_seqs_cardinality: List[int],
-) -> str:
-    msa = "#" + ",".join(map(str, map(len, query_seqs_unique))) + "\t"
-    msa += ",".join(map(str, query_seqs_cardinality)) + "\n"
-    # build msa with cardinality of 1, it makes it easier to parse and manipulate
-    query_seqs_cardinality = [1 for _ in query_seqs_cardinality]
-    msa += pair_msa(query_seqs_unique, query_seqs_cardinality, paired_msa, unpaired_msa)
-    return msa
-
-def str_to_msa(msa_fname):
-    return None, None, None, None
-
-def generate_msa(cur_result_dir, raw_jobname, jobname, use_templates, a3m_lines,
-                 query_sequence, msa_mode, custom_template_path, pair_mode, host_url):
-
-    """ Generate msa on the fly or read from local cache.
-    """
-    load_cache = False
-    a3m_fname = join(cur_result_dir, f"{raw_jobname}.a3m")
-    template_feat_fname = join(cur_result_dir, f"{raw_jobname}_template_feats.txt")
-
-    # if exists(a3m_fname) and exists(template_feat_fname):
-    #     # read from local cache
-    #     load_cache = True
-    #     unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality = \
-    #         str_to_msa(a3m_fname)
-
-    #     with open(template_feat_fname, "rb") as fp:
-    #         template_features = pickle.load(fp)
-
-    if a3m_lines is not None:
-        if use_templates is False:
-            (unpaired_msa, paired_msa, query_seqs_unique,
-             query_seqs_cardinality, template_features) = \
-                 unserialize_msa(a3m_lines, query_sequence)
-        else:
-            (unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality) = \
-                unserialize_msa(a3m_lines, query_sequence)[:4]
-
-            template_features = get_msa_and_templates(
-                jobname, query_sequence, cur_result_dir, msa_mode, use_templates,
-                custom_template_path, pair_mode, host_url)[4]
-    else:
-        unpaired_msa, paired_msa, query_seqs_unique, \
-            query_seqs_cardinality, template_features = get_msa_and_templates(
-                jobname, query_sequence, cur_result_dir, msa_mode,
-                use_templates, custom_template_path, pair_mode, host_url)
-
-    # print(query_sequence)
-    print('*********')
-    # print(query_seqs_unique)
-    print(query_seqs_cardinality)
-    assert 0
-
-    if not load_cache:
-        msa = msa_to_str(unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality)
-        cur_result_dir.joinpath(jobname + ".a3m").write_text(msa)
-
-        with open(template_feat_fname, "wb") as fp:
-            pickle.dump(template_features, fp)
-
-    return unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality, template_features
+##########
+# Running
+##########
 
 def run(queries: List[Tuple[str, Union[str, List[str]], Optional[List[str]]]],
         result_dir: Union[str, Path],
